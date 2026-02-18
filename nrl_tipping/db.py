@@ -86,11 +86,24 @@ def init_db(conn: sqlite3.Connection) -> None:
             updated_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS ladder_predictions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            season_year INTEGER NOT NULL,
+            team TEXT NOT NULL,
+            predicted_position INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(user_id, season_year, team),
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
         CREATE INDEX IF NOT EXISTS idx_fixtures_start_time ON fixtures(start_time_utc);
         CREATE INDEX IF NOT EXISTS idx_fixtures_round ON fixtures(round_number);
         CREATE INDEX IF NOT EXISTS idx_tips_user ON tips(user_id);
         CREATE INDEX IF NOT EXISTS idx_tips_fixture ON tips(fixture_id);
         CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);
+        CREATE INDEX IF NOT EXISTS idx_ladder_pred_user_season ON ladder_predictions(user_id, season_year);
         """
     )
     _ensure_column(conn, "fixtures", "home_logo_url", "TEXT")

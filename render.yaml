@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: nrl-tipping
+    runtime: python
+    buildCommand: mkdir -p data static/avatars
+    startCommand: python app.py $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12"
+      - key: NRL_ADMIN_PASSWORD
+        sync: false
+      - key: ODDS_API_KEY
+        sync: false
+      - key: FACEBOOK_APP_ID
+        sync: false
+      - key: FACEBOOK_APP_SECRET
+        sync: false

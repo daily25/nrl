@@ -867,6 +867,191 @@ pre {
   color: var(--muted);
 }
 
+/* ── Predict the Ladder ── */
+.pldr-countdown-wrap {
+  margin: 0.4rem 0 0.8rem;
+  padding: 0.6rem 0.8rem;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #0d2b23, #0e4a3a);
+  color: #fff;
+  text-align: center;
+}
+
+.pldr-countdown-wrap.pldr-cd-expired {
+  background: linear-gradient(135deg, #3a1a15, #5a2a20);
+}
+
+.pldr-cd-label {
+  display: block;
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  opacity: 0.8;
+  margin-bottom: 0.25rem;
+}
+
+.pldr-cd-time {
+  display: flex;
+  justify-content: center;
+  gap: 0.5rem;
+}
+
+.pldr-cd-unit {
+  font-size: 0.82rem;
+  font-weight: 700;
+  opacity: 0.75;
+}
+
+.pldr-cd-num {
+  font-size: 1.5rem;
+  font-weight: 800;
+  opacity: 1;
+  margin-right: 0.1rem;
+}
+
+.pldr-cd-closed {
+  font-size: 1.1rem;
+  font-weight: 800;
+  letter-spacing: 0.03em;
+}
+
+.pldr-status {
+  margin: 0.3rem 0 0.7rem;
+  color: var(--muted);
+}
+
+.pldr-list {
+  list-style: none;
+  margin: 0 0 1rem;
+  padding: 0;
+  max-width: 480px;
+}
+
+.pldr-item {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  margin-bottom: 0.35rem;
+  background: var(--paper);
+  cursor: grab;
+  user-select: none;
+  transition: box-shadow 0.15s, opacity 0.15s;
+}
+
+.pldr-item:active {
+  cursor: grabbing;
+}
+
+.pldr-item.dragging {
+  opacity: 0.5;
+  box-shadow: 0 4px 16px rgba(16, 33, 43, 0.18);
+}
+
+.pldr-pos {
+  min-width: 1.8rem;
+  text-align: center;
+  font-weight: 800;
+  color: var(--muted);
+}
+
+.pldr-logo {
+  width: 28px;
+  height: 28px;
+  object-fit: contain;
+  flex: 0 0 auto;
+}
+
+.pldr-name {
+  flex: 1 1 auto;
+  font-weight: 700;
+}
+
+.pldr-handle {
+  font-size: 1.2rem;
+  color: var(--muted);
+  padding: 0 0.3rem;
+  cursor: grab;
+}
+
+.pldr-finals {
+  background: #f3faf7;
+  border-color: #b5ddd0;
+}
+
+.pldr-zone {
+  list-style: none;
+  padding: 0.3rem 0.6rem;
+  font-size: 0.78rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin: 0.5rem 0 0.15rem;
+}
+
+.pldr-zone-finals {
+  color: #0d7a61;
+}
+
+.pldr-zone-elim {
+  color: #9f2a1f;
+}
+
+.pldr-note {
+  margin: 0.3rem 0 0.6rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.pldr-lb-table {
+  width: 100%;
+  border-collapse: collapse;
+  max-width: 480px;
+}
+
+.pldr-lb-table th,
+.pldr-lb-table td {
+  padding: 0.45rem 0.4rem;
+  border-bottom: 1px solid #ece7dc;
+}
+
+.pldr-lb-table th:first-child,
+.pldr-lb-table td:first-child {
+  width: 2.5rem;
+  text-align: center;
+  font-weight: 700;
+  color: var(--muted);
+}
+
+.pldr-lb-player {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.pldr-lb-avatar {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  object-fit: cover;
+  border: 1px solid #d5cfbf;
+  background: #f4efe4;
+  flex: 0 0 auto;
+}
+
+.pldr-lb-diff {
+  font-weight: 800;
+  color: var(--accent);
+  text-align: center;
+}
+
+.pldr-lb-me {
+  background: #f0faf6;
+}
+
 @media (max-width: 900px) {
   body.has-mobile-footer {
     padding-bottom: calc(5.4rem + env(safe-area-inset-bottom));
@@ -883,7 +1068,7 @@ pre {
     bottom: 0;
     z-index: 95;
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
     gap: 0.35rem;
     padding: 0.5rem 0.6rem calc(0.55rem + env(safe-area-inset-bottom));
     border-top: 1px solid var(--line);

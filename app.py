@@ -31,15 +31,19 @@ from nrl_tipping.config import (
 from nrl_tipping.db import connect_db, get_setting, init_db, set_setting
 from nrl_tipping.queries import (
     apply_automatic_underdog_tips,
+    get_all_teams,
     get_current_round,
     get_ladder,
+    get_ladder_prediction_leaderboard,
     get_leaderboard,
     get_leaderboard_with_rounds,
     get_round_fixtures,
     get_round_leaderboard,
     get_round_numbers,
     get_round_tipsheet_data,
+    get_user_ladder_prediction,
     get_user_tips_for_round,
+    save_ladder_prediction,
     save_tips,
 )
 from nrl_tipping.score_worker import start_score_update_worker
@@ -51,6 +55,7 @@ from nrl_tipping.views import (
     render_leaderboard,
     render_login,
     render_page,
+    render_predict_ladder,
     render_profile,
     render_register,
     render_tips,
@@ -628,6 +633,28 @@ class NRLTippingHandler(BaseHTTPRequestHandler):
                 )
                 return
 
+            if path == "/predict-ladder":
+                if not user:
+                    self._redirect("/login")
+                    return
+                season_year = sydney_now().year
+                teams = get_all_teams(conn, season_year=season_year)
+                existing = get_user_ladder_prediction(conn, int(user["id"]), season_year)
+                actual_ladder = get_ladder(conn, season_year=season_year)
+                lb = get_ladder_prediction_leaderboard(conn, season_year, actual_ladder)
+                page = render_predict_ladder(
+                    user=user,
+                    teams=teams,
+                    existing_prediction=existing,
+                    leaderboard=lb,
+                    actual_ladder=actual_ladder,
+                    season_year=season_year,
+                )
+                self._send_html(
+                    render_page("Predict the Ladder", page, user=user, flash=flash, flash_kind=kind)
+                )
+                return
+
             if path == "/tipsheet":
                 if not user:
                     self._redirect("/login")
@@ -854,6 +881,37 @@ class NRLTippingHandler(BaseHTTPRequestHandler):
                     }
                 )
                 self._redirect(f"/tips?{redirect_query}")
+                return
+
+            if path == "/predict-ladder":
+                if not user:
+                    self._redirect("/login")
+                    return
+                season_year_raw = form.get("season_year", [""])[0]
+                try:
+                    season_year = int(season_year_raw)
+                except ValueError:
+                    season_year = sydney_now().year
+                # Enforce deadline: 12 March at 8pm Sydney time
+                from datetime import datetime, timezone, timedelta
+                deadline = datetime(season_year, 3, 12, 20, 0, 0, tzinfo=timezone(timedelta(hours=11)))
+                if sydney_now().astimezone(timezone.utc) >= deadline.astimezone(timezone.utc):
+                    self._redirect_with_message("/predict-ladder", "Predictions are closed.", "error")
+                    return
+                order_raw = form.get("order", [""])[0]
+                try:
+                    ordered_teams = json.loads(order_raw)
+                    if not isinstance(ordered_teams, list):
+                        raise ValueError
+                except (json.JSONDecodeError, ValueError):
+                    self._redirect_with_message("/predict-ladder", "Invalid prediction data.", "error")
+                    return
+                saved = save_ladder_prediction(conn, int(user["id"]), season_year, ordered_teams)
+                self._redirect_with_message(
+                    "/predict-ladder",
+                    f"Prediction saved! ({saved} teams)",
+                    "ok",
+                )
                 return
 
             if path == "/profile/details":

@@ -365,21 +365,38 @@ def get_ladder(conn: sqlite3.Connection, season_year: int) -> list[dict[str, Any
         """,
         (season_year, season_year),
     ).fetchall()
-    return [
-        {
-            "team": row["team"],
-            "played": int(row["played"]),
-            "won": int(row["won"]),
-            "lost": int(row["lost"]),
-            "drawn": int(row["drawn"]),
-            "points_for": int(row["points_for"]),
-            "points_against": int(row["points_against"]),
-            "point_diff": int(row["point_diff"]),
-            "comp_points": int(row["comp_points"]),
-            "logo_url": row["logo_url"],
-        }
-        for row in rows
-    ]
+    # Merge rows that map to the same normalized team name
+    merged: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        full_name = normalize_team_name(row["team"])
+        if full_name in merged:
+            m = merged[full_name]
+            m["played"] += int(row["played"])
+            m["won"] += int(row["won"])
+            m["lost"] += int(row["lost"])
+            m["drawn"] += int(row["drawn"])
+            m["points_for"] += int(row["points_for"])
+            m["points_against"] += int(row["points_against"])
+            m["point_diff"] += int(row["point_diff"])
+            m["comp_points"] += int(row["comp_points"])
+            if not m["logo_url"] and row["logo_url"]:
+                m["logo_url"] = row["logo_url"]
+        else:
+            merged[full_name] = {
+                "team": full_name,
+                "played": int(row["played"]),
+                "won": int(row["won"]),
+                "lost": int(row["lost"]),
+                "drawn": int(row["drawn"]),
+                "points_for": int(row["points_for"]),
+                "points_against": int(row["points_against"]),
+                "point_diff": int(row["point_diff"]),
+                "comp_points": int(row["comp_points"]),
+                "logo_url": row["logo_url"],
+            }
+    result = list(merged.values())
+    result.sort(key=lambda t: (-t["comp_points"], -t["point_diff"], -t["points_for"], t["team"]))
+    return result
 
 
 def get_leaderboard_with_rounds(
@@ -579,3 +596,134 @@ def get_round_tipsheet_data(
         "all_submitted": all_submitted,
         "total_required": total_required,
     }
+
+
+NRL_TEAM_ALIASES: dict[str, str] = {
+    "Broncos": "Brisbane Broncos",
+    "Raiders": "Canberra Raiders",
+    "Bulldogs": "Canterbury Bulldogs",
+    "Sharks": "Cronulla Sutherland Sharks",
+    "Titans": "Gold Coast Titans",
+    "Sea Eagles": "Manly Warringah Sea Eagles",
+    "Storm": "Melbourne Storm",
+    "Warriors": "New Zealand Warriors",
+    "Knights": "Newcastle Knights",
+    "Cowboys": "North Queensland Cowboys",
+    "Eels": "Parramatta Eels",
+    "Panthers": "Penrith Panthers",
+    "Rabbitohs": "South Sydney Rabbitohs",
+    "Dragons": "St George Illawarra Dragons",
+    "Roosters": "Sydney Roosters",
+}
+
+
+def normalize_team_name(name: str) -> str:
+    return NRL_TEAM_ALIASES.get(name, name)
+
+
+def get_all_teams(conn: sqlite3.Connection, season_year: int) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT team, MAX(logo_url) AS logo_url FROM (
+            SELECT home_team AS team, home_logo_url AS logo_url
+            FROM fixtures WHERE season_year = ?
+            UNION ALL
+            SELECT away_team AS team, away_logo_url AS logo_url
+            FROM fixtures WHERE season_year = ?
+        )
+        GROUP BY team
+        ORDER BY team ASC
+        """,
+        (season_year, season_year),
+    ).fetchall()
+    # Normalize short names to full names and deduplicate
+    merged: dict[str, str | None] = {}
+    for row in rows:
+        full_name = normalize_team_name(row["team"])
+        existing_logo = merged.get(full_name)
+        logo = row["logo_url"]
+        if not existing_logo and logo:
+            merged[full_name] = logo
+        elif full_name not in merged:
+            merged[full_name] = logo
+    return [
+        {"team": team, "logo_url": logo}
+        for team, logo in sorted(merged.items())
+    ]
+
+
+def get_user_ladder_prediction(
+    conn: sqlite3.Connection, user_id: int, season_year: int,
+) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT team, predicted_position
+        FROM ladder_predictions
+        WHERE user_id = ? AND season_year = ?
+        ORDER BY predicted_position ASC
+        """,
+        (user_id, season_year),
+    ).fetchall()
+    return [{"team": str(row["team"]), "position": int(row["predicted_position"])} for row in rows]
+
+
+def save_ladder_prediction(
+    conn: sqlite3.Connection,
+    user_id: int,
+    season_year: int,
+    ordered_teams: list[str],
+) -> int:
+    now = utc_now_iso()
+    saved = 0
+    for position, team in enumerate(ordered_teams, start=1):
+        conn.execute(
+            """
+            INSERT INTO ladder_predictions(user_id, season_year, team, predicted_position, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, season_year, team)
+            DO UPDATE SET predicted_position = excluded.predicted_position, updated_at = excluded.updated_at
+            """,
+            (user_id, season_year, team, position, now, now),
+        )
+        saved += 1
+    conn.commit()
+    return saved
+
+
+def get_ladder_prediction_leaderboard(
+    conn: sqlite3.Connection, season_year: int, actual_ladder: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    actual_positions: dict[str, int] = {}
+    for idx, team in enumerate(actual_ladder, start=1):
+        actual_positions[team["team"]] = idx
+
+    users = conn.execute(
+        """
+        SELECT DISTINCT lp.user_id, u.display_name, u.avatar_url
+        FROM ladder_predictions lp
+        JOIN users u ON u.id = lp.user_id
+        WHERE lp.season_year = ?
+        """,
+        (season_year,),
+    ).fetchall()
+
+    results = []
+    for user_row in users:
+        uid = int(user_row["user_id"])
+        predictions = get_user_ladder_prediction(conn, uid, season_year)
+        total_diff = 0
+        for pred in predictions:
+            actual_pos = actual_positions.get(pred["team"])
+            if actual_pos is not None:
+                total_diff += abs(pred["position"] - actual_pos)
+            else:
+                total_diff += 16
+        results.append({
+            "user_id": uid,
+            "display_name": str(user_row["display_name"]),
+            "avatar_url": str(user_row["avatar_url"]) if user_row["avatar_url"] else None,
+            "total_diff": total_diff,
+            "predictions": predictions,
+        })
+    results.sort(key=lambda r: r["total_diff"])
+    return results

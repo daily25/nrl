@@ -22,6 +22,7 @@ def _nav(user: Row | None) -> str:
         <a href="/tipsheet">Tipsheet</a>
         <a href="/leaderboard">Leaderboard</a>
         <a href="/ladder">NRL Ladder</a>
+        <a href="/predict-ladder">Predict Ladder</a>
         <a href="/profile">Profile</a>
         {admin_link}
         <form method="post" action="/logout" class="logout-form">
@@ -40,17 +41,20 @@ def _mobile_footer_nav(user: Row | None, title: str) -> str:
         "Leaderboard": "leaderboard",
         "Tipsheet": "tipsheet",
         "NRL Ladder": "ladder",
+        "Predict the Ladder": "predict-ladder",
     }.get(title, "")
     tips_active = ' class="active"' if active_key == "tips" else ""
     leaderboard_active = ' class="active"' if active_key == "leaderboard" else ""
     tipsheet_active = ' class="active"' if active_key == "tipsheet" else ""
     ladder_active = ' class="active"' if active_key == "ladder" else ""
+    predict_active = ' class="active"' if active_key == "predict-ladder" else ""
     return f"""
     <nav class="mobile-footer-nav" aria-label="Footer navigation">
       <a href="/tips"{tips_active}>My Tips</a>
       <a href="/leaderboard"{leaderboard_active}>Leaderboard</a>
       <a href="/tipsheet"{tipsheet_active}>Tipsheet</a>
-      <a href="/ladder"{ladder_active}>NRL Ladder</a>
+      <a href="/ladder"{ladder_active}>Ladder</a>
+      <a href="/predict-ladder"{predict_active}>Predict</a>
     </nav>
     """
 
@@ -721,6 +725,253 @@ def render_ladder(ladder: list[dict[str, Any]], season_year: int) -> str:
       </div>
       <p class="ladder-note">Top 8 teams qualify for finals.</p>
     </section>
+    """
+
+
+def render_predict_ladder(
+    user: Row,
+    teams: list[dict[str, Any]],
+    existing_prediction: list[dict[str, Any]],
+    leaderboard: list[dict[str, Any]],
+    actual_ladder: list[dict[str, Any]],
+    season_year: int,
+) -> str:
+    # Build ordered team list: use existing prediction order, or default alphabetical
+    if existing_prediction:
+        ordered = existing_prediction
+        team_lookup = {t["team"]: t for t in teams}
+        team_items = []
+        for pred in ordered:
+            t = team_lookup.get(pred["team"], {})
+            logo = t.get("logo_url") or ""
+            team_items.append({"team": pred["team"], "logo_url": logo})
+    else:
+        team_items = list(teams)
+
+    total = len(team_items)
+    list_html = []
+    for idx, t in enumerate(team_items, start=1):
+        logo_html = (
+            f'<img src="{escape(str(t["logo_url"]))}" alt="" class="pldr-logo">'
+            if t.get("logo_url")
+            else ""
+        )
+        finals_cls = " pldr-finals" if idx <= 8 else ""
+        # Insert zone headers
+        if idx == 1:
+            list_html.append('<li class="pldr-zone pldr-zone-finals">Finals (1&ndash;8)</li>')
+        elif idx == 9:
+            list_html.append('<li class="pldr-zone pldr-zone-elim">Eliminated (9&ndash;{0})</li>'.format(total))
+        list_html.append(
+            f'<li class="pldr-item{finals_cls}" data-team="{escape(t["team"])}">'
+            f'<span class="pldr-pos">{idx}</span>'
+            f'{logo_html}'
+            f'<span class="pldr-name">{escape(t["team"])}</span>'
+            f'<span class="pldr-handle">&#x2630;</span>'
+            f'</li>'
+        )
+
+    has_prediction = bool(existing_prediction)
+    status_text = "Your prediction is saved." if has_prediction else "Drag teams into your predicted order, then save."
+
+    # Leaderboard section
+    lb_html = ""
+    if leaderboard and actual_ladder:
+        lb_rows = []
+        for idx, entry in enumerate(leaderboard, start=1):
+            avatar = _avatar_html(entry["display_name"], entry["avatar_url"], "pldr-lb-avatar")
+            is_me = " class='pldr-lb-me'" if entry["user_id"] == int(user["id"]) else ""
+            lb_rows.append(
+                f"<tr{is_me}>"
+                f"<td>{idx}</td>"
+                f"<td class='pldr-lb-player'>{avatar}<span>{escape(entry['display_name'])}</span></td>"
+                f"<td class='pldr-lb-diff'>{entry['total_diff']}</td>"
+                f"</tr>"
+            )
+        lb_html = f"""
+        <section class="card" style="margin-top:1rem">
+          <h3>Ladder Prediction Standings</h3>
+          <p class="pldr-note">Lower score = closer to actual ladder. Best possible score is 0.</p>
+          <table class="pldr-lb-table">
+            <thead><tr><th>#</th><th>Player</th><th>Diff</th></tr></thead>
+            <tbody>{"".join(lb_rows)}</tbody>
+          </table>
+        </section>
+        """
+
+    return f"""
+    <section class="card">
+      <h2>Predict the Ladder &mdash; {season_year}</h2>
+      <div class="pldr-countdown-wrap" id="pldr-countdown-wrap">
+        <div class="pldr-countdown" id="pldr-countdown"></div>
+      </div>
+      <p class="pldr-status">{status_text}</p>
+      <form method="post" action="/predict-ladder" id="pldr-form">
+        <input type="hidden" name="season_year" value="{season_year}">
+        <ol class="pldr-list" id="pldr-list">
+          {"".join(list_html)}
+        </ol>
+        <input type="hidden" name="order" id="pldr-order" value="">
+        <button type="submit" id="pldr-submit">Save Prediction</button>
+      </form>
+    </section>
+    {lb_html}
+    <script>
+    (() => {{
+      const list = document.getElementById("pldr-list");
+      const orderInput = document.getElementById("pldr-order");
+      if (!list || !orderInput) return;
+
+      let dragItem = null;
+      let touchStartY = 0;
+      let touchOffsetY = 0;
+
+      function updatePositions() {{
+        // Remove old zone headers
+        list.querySelectorAll(".pldr-zone").forEach(z => z.remove());
+        const items = list.querySelectorAll(".pldr-item");
+        const total = items.length;
+        items.forEach((el, i) => {{
+          const pos = i + 1;
+          el.querySelector(".pldr-pos").textContent = pos;
+          el.classList.toggle("pldr-finals", pos <= 8);
+          // Insert zone headers
+          if (pos === 1) {{
+            const hdr = document.createElement("li");
+            hdr.className = "pldr-zone pldr-zone-finals";
+            hdr.innerHTML = "Finals (1&ndash;8)";
+            list.insertBefore(hdr, el);
+          }} else if (pos === 9) {{
+            const hdr = document.createElement("li");
+            hdr.className = "pldr-zone pldr-zone-elim";
+            hdr.innerHTML = "Eliminated (9&ndash;" + total + ")";
+            list.insertBefore(hdr, el);
+          }}
+        }});
+        const teams = Array.from(items).map(el => el.dataset.team);
+        orderInput.value = JSON.stringify(teams);
+      }}
+
+      // Desktop drag & drop
+      list.addEventListener("dragstart", (e) => {{
+        if (!e.target.classList.contains("pldr-item")) return;
+        dragItem = e.target;
+        e.target.classList.add("dragging");
+        e.dataTransfer.effectAllowed = "move";
+      }});
+
+      list.addEventListener("dragend", (e) => {{
+        if (dragItem) dragItem.classList.remove("dragging");
+        dragItem = null;
+        updatePositions();
+      }});
+
+      list.addEventListener("dragover", (e) => {{
+        e.preventDefault();
+        const target = e.target.closest(".pldr-item");
+        if (!target || target === dragItem) return;
+        const rect = target.getBoundingClientRect();
+        const mid = rect.top + rect.height / 2;
+        if (e.clientY < mid) {{
+          list.insertBefore(dragItem, target);
+        }} else {{
+          list.insertBefore(dragItem, target.nextSibling);
+        }}
+      }});
+
+      // Touch drag & drop
+      list.addEventListener("touchstart", (e) => {{
+        const handle = e.target.closest(".pldr-handle");
+        if (!handle) return;
+        const item = handle.closest(".pldr-item");
+        if (!item) return;
+        dragItem = item;
+        const touch = e.touches[0];
+        const rect = item.getBoundingClientRect();
+        touchStartY = touch.clientY;
+        touchOffsetY = touch.clientY - rect.top;
+        item.classList.add("dragging");
+      }}, {{ passive: true }});
+
+      list.addEventListener("touchmove", (e) => {{
+        if (!dragItem) return;
+        e.preventDefault();
+        const touch = e.touches[0];
+        const items = Array.from(list.querySelectorAll(".pldr-item:not(.dragging)"));
+        for (const item of items) {{
+          const rect = item.getBoundingClientRect();
+          const mid = rect.top + rect.height / 2;
+          if (touch.clientY < mid) {{
+            list.insertBefore(dragItem, item);
+            break;
+          }} else if (item === items[items.length - 1]) {{
+            list.insertBefore(dragItem, item.nextSibling);
+          }}
+        }}
+      }}, {{ passive: false }});
+
+      list.addEventListener("touchend", () => {{
+        if (dragItem) {{
+          dragItem.classList.remove("dragging");
+          dragItem = null;
+          updatePositions();
+        }}
+      }});
+
+      // Make items draggable
+      list.querySelectorAll(".pldr-item").forEach(el => {{
+        el.setAttribute("draggable", "true");
+      }});
+
+      // Set initial order
+      updatePositions();
+    }})();
+
+    // Countdown timer — deadline 12 March {season_year} 8pm Sydney (AEDT = UTC+11)
+    (() => {{
+      const DEADLINE = new Date("{season_year}-03-12T20:00:00+11:00").getTime();
+      const countdownEl = document.getElementById("pldr-countdown");
+      const wrapEl = document.getElementById("pldr-countdown-wrap");
+      const form = document.getElementById("pldr-form");
+      const submitBtn = document.getElementById("pldr-submit");
+      if (!countdownEl) return;
+
+      function pad(n) {{ return String(n).padStart(2, "0"); }}
+
+      function tick() {{
+        const now = Date.now();
+        const diff = DEADLINE - now;
+        if (diff <= 0) {{
+          countdownEl.innerHTML = '<span class="pldr-cd-closed">Predictions are closed</span>';
+          if (wrapEl) wrapEl.classList.add("pldr-cd-expired");
+          if (submitBtn) {{ submitBtn.disabled = true; submitBtn.textContent = "Closed"; }}
+          // Disable dragging
+          document.querySelectorAll(".pldr-item").forEach(el => {{
+            el.removeAttribute("draggable");
+            el.style.cursor = "default";
+          }});
+          document.querySelectorAll(".pldr-handle").forEach(el => {{
+            el.style.display = "none";
+          }});
+          return;
+        }}
+        const days = Math.floor(diff / 86400000);
+        const hours = Math.floor((diff % 86400000) / 3600000);
+        const mins = Math.floor((diff % 3600000) / 60000);
+        const secs = Math.floor((diff % 60000) / 1000);
+        countdownEl.innerHTML =
+          '<span class="pldr-cd-label">Predictions close in</span>' +
+          '<span class="pldr-cd-time">' +
+          (days > 0 ? '<span class="pldr-cd-unit"><span class="pldr-cd-num">' + days + '</span>d</span>' : '') +
+          '<span class="pldr-cd-unit"><span class="pldr-cd-num">' + pad(hours) + '</span>h</span>' +
+          '<span class="pldr-cd-unit"><span class="pldr-cd-num">' + pad(mins) + '</span>m</span>' +
+          '<span class="pldr-cd-unit"><span class="pldr-cd-num">' + pad(secs) + '</span>s</span>' +
+          '</span>';
+        setTimeout(tick, 1000);
+      }}
+      tick();
+    }})();
+    </script>
     """
 
 
