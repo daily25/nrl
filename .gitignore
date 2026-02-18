@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+data/*.db
+data/nrl_season_*.json
+data/*.pem
+.env
+.tmp_*
+.run*.log
+.claude/
+
+aldo.png
