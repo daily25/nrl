@@ -5,7 +5,63 @@ from sqlite3 import Row
 from typing import Any
 
 from nrl_tipping.config import TIP_LOCK_MINUTES
-from nrl_tipping.utils import display_sydney, is_tip_locked, sydney_now
+from nrl_tipping.utils import display_sydney, is_round_locked, is_tip_locked, sydney_now
+
+
+def _push_subscribe_script() -> str:
+    """Return JS that silently re-subscribes if permission already granted.
+
+    Does NOT auto-prompt — the profile page has an explicit button for that.
+    """
+    return """
+    <script>
+    (async () => {
+      if (!("serviceWorker" in navigator) || !("PushManager" in window)) return;
+      if (Notification.permission !== "granted") return;
+
+      let vapidKey;
+      try {
+        const resp = await fetch("/api/push/vapid-key");
+        const data = await resp.json();
+        vapidKey = data.vapid_public_key;
+        if (!vapidKey) return;
+      } catch (e) { return; }
+
+      const reg = await navigator.serviceWorker.ready;
+      let sub = await reg.pushManager.getSubscription();
+
+      if (sub) {
+        await fetch("/api/push/subscribe", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(sub.toJSON()),
+        }).catch(() => {});
+        return;
+      }
+
+      function urlBase64ToUint8Array(base64String) {
+        const padding = "=".repeat((4 - base64String.length % 4) % 4);
+        const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+        const raw = atob(base64);
+        const arr = new Uint8Array(raw.length);
+        for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+        return arr;
+      }
+
+      try {
+        sub = await reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(vapidKey),
+        });
+        await fetch("/api/push/subscribe", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(sub.toJSON()),
+        });
+      } catch (e) {}
+    })();
+    </script>
+    """
 
 
 def _nav(user: Row | None) -> str:
@@ -23,6 +79,7 @@ def _nav(user: Row | None) -> str:
         <a href="/leaderboard">Leaderboard</a>
         <a href="/ladder">NRL Ladder</a>
         <a href="/predict-ladder">Predict Ladder</a>
+        <a href="/predictions">Predictions</a>
         <a href="/profile">Profile</a>
         {admin_link}
         <form method="post" action="/logout" class="logout-form">
@@ -40,21 +97,18 @@ def _mobile_footer_nav(user: Row | None, title: str) -> str:
         "Weekly Tips": "tips",
         "Leaderboard": "leaderboard",
         "Tipsheet": "tipsheet",
-        "NRL Ladder": "ladder",
         "Predict the Ladder": "predict-ladder",
     }.get(title, "")
     tips_active = ' class="active"' if active_key == "tips" else ""
-    leaderboard_active = ' class="active"' if active_key == "leaderboard" else ""
-    tipsheet_active = ' class="active"' if active_key == "tipsheet" else ""
-    ladder_active = ' class="active"' if active_key == "ladder" else ""
     predict_active = ' class="active"' if active_key == "predict-ladder" else ""
+    tipsheet_active = ' class="active"' if active_key == "tipsheet" else ""
+    leaderboard_active = ' class="active"' if active_key == "leaderboard" else ""
     return f"""
     <nav class="mobile-footer-nav" aria-label="Footer navigation">
       <a href="/tips"{tips_active}>My Tips</a>
-      <a href="/leaderboard"{leaderboard_active}>Leaderboard</a>
-      <a href="/tipsheet"{tipsheet_active}>Tipsheet</a>
-      <a href="/ladder"{ladder_active}>Ladder</a>
       <a href="/predict-ladder"{predict_active}>Predict</a>
+      <a href="/tipsheet"{tipsheet_active}>Tipsheet</a>
+      <a href="/leaderboard"{leaderboard_active}>Leaderboard</a>
     </nav>
     """
 
@@ -87,16 +141,10 @@ def render_page(
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body class="{body_class}">
-  <div id="app-loader" class="loading-screen">
-    <div class="loading-card">
-      <img src="/static/icon-512.png" alt="Aldo's Tipping Comp logo" class="loading-logo">
-      <p>Loading Aldo&apos;s Tipping Comp...</p>
-    </div>
-  </div>
   <main class="container">
     <header class="header">
       <div class="brand-wrap">
-        <img src="/static/icon-512.png" alt="Aldo's Tipping Comp logo" class="app-logo">
+        <a href="/tips"><img src="/static/icon-512.png" alt="Aldo's Tipping Comp logo" class="app-logo"></a>
         <h1>Aldo&apos;s Tipping Comp</h1>
       </div>
       {_nav(user)}
@@ -106,16 +154,6 @@ def render_page(
   </main>
   {_mobile_footer_nav(user, title)}
   <script>
-    (() => {{
-      const loader = document.getElementById("app-loader");
-      if (!loader) return;
-      const hideLoader = () => {{
-        loader.classList.add("hidden");
-        setTimeout(() => loader.remove(), 420);
-      }};
-      window.addEventListener("load", hideLoader, {{ once: true }});
-      setTimeout(hideLoader, 1500);
-    }})();
     (() => {{
       const toggle = document.getElementById("menu-toggle");
       const menu = document.getElementById("site-menu");
@@ -162,6 +200,7 @@ def render_page(
       }}
     }}
   </script>
+  {_push_subscribe_script() if user else ""}
 </body>
 </html>"""
 
@@ -266,6 +305,194 @@ def render_profile(user: Row) -> str:
         <button type="submit">Update password</button>
       </form>
     </section>
+
+    <section class="card" id="push-section">
+      <h3>Notifications</h3>
+      <p>Get a reminder when tips are due before each round.</p>
+      <div id="push-status"><p style="color:var(--muted)">Checking...</p></div>
+      <button type="button" id="push-toggle-btn" style="display:none">Enable notifications</button>
+    </section>
+    <script>
+    (function() {{
+      var statusEl = document.getElementById("push-status");
+      var btn = document.getElementById("push-toggle-btn");
+
+      var isBrave = navigator.brave && typeof navigator.brave.isBrave === "function";
+      if (isBrave) {{
+        statusEl.innerHTML = "<p style='color:var(--muted)'>Push notifications are not supported in Brave browser. Try Chrome or Samsung Browser instead.</p>";
+        return;
+      }}
+      if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) {{
+        statusEl.innerHTML = "<p style='color:var(--muted)'>Push notifications are not supported on this device/browser.</p>";
+        return;
+      }}
+
+      function urlB64(base64String) {{
+        var padding = "=".repeat((4 - base64String.length % 4) % 4);
+        var base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+        var raw = atob(base64);
+        var arr = new Uint8Array(raw.length);
+        for (var i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+        return arr;
+      }}
+
+      var vapidKey = null;
+
+      function getVapidKey() {{
+        return fetch("/api/push/vapid-key")
+          .then(function(r) {{ return r.json(); }})
+          .then(function(d) {{ vapidKey = d.vapid_public_key || null; return vapidKey; }})
+          .catch(function() {{ return null; }});
+      }}
+
+      function ensureSW() {{
+        return navigator.serviceWorker.register("/service-worker.js").then(function(reg) {{
+          if (reg.active) return reg;
+          return new Promise(function(resolve) {{
+            var sw = reg.installing || reg.waiting;
+            if (!sw) {{ console.warn("ensureSW: no installing/waiting worker"); return resolve(null); }}
+            if (sw.state === "activated") return resolve(reg);
+            console.log("ensureSW: waiting for state:", sw.state);
+            var t = setTimeout(function() {{
+              console.warn("ensureSW: timed out in state:", sw.state);
+              resolve(null);
+            }}, 10000);
+            sw.addEventListener("statechange", function() {{
+              console.log("ensureSW: statechange:", sw.state);
+              if (sw.state === "activated") {{ clearTimeout(t); resolve(reg); }}
+              else if (sw.state === "redundant") {{ clearTimeout(t); resolve(null); }}
+            }});
+          }});
+        }}).catch(function(e) {{
+          console.error("ensureSW error:", e);
+          return null;
+        }});
+      }}
+
+      function showEnabled() {{
+        statusEl.innerHTML = "<p style='color:#2e7d32'>Notifications are <strong>enabled</strong>.</p>";
+        btn.textContent = "Disable notifications";
+        btn.style.display = "";
+        btn.disabled = false;
+        btn.onclick = disablePush;
+      }}
+
+      function showOff() {{
+        statusEl.innerHTML = "<p>Notifications are <strong>off</strong>.</p>";
+        btn.textContent = "Enable notifications";
+        btn.style.display = "";
+        btn.disabled = false;
+        btn.onclick = enablePush;
+      }}
+
+      function showError(msg) {{
+        statusEl.innerHTML = "<p style='color:#c62828'>" + msg + "</p>";
+        btn.textContent = "Try again";
+        btn.style.display = "";
+        btn.disabled = false;
+        btn.onclick = enablePush;
+      }}
+
+      function updateUI() {{
+        var perm = Notification.permission;
+        if (perm === "denied") {{
+          statusEl.innerHTML = "<p style='color:var(--muted)'>Notifications are blocked. To fix: open your browser settings &rarr; Site settings &rarr; Notifications &rarr; find this site and change to Allow. Then refresh this page.</p>";
+          btn.style.display = "none";
+          return Promise.resolve();
+        }}
+
+        return getVapidKey().then(function(key) {{
+          if (!key) {{
+            statusEl.innerHTML = "<p style='color:var(--muted)'>Push notifications are not configured on this server.</p>";
+            btn.style.display = "none";
+            return;
+          }}
+          return ensureSW().then(function(reg) {{
+            if (!reg) {{
+              showOff();
+              return;
+            }}
+            return reg.pushManager.getSubscription().then(function(sub) {{
+              if (perm === "granted" && sub) {{
+                showEnabled();
+              }} else {{
+                showOff();
+              }}
+            }});
+          }});
+        }}).catch(function() {{
+          showOff();
+        }});
+      }}
+
+      function enablePush() {{
+        btn.disabled = true;
+        btn.textContent = "Enabling...";
+        statusEl.innerHTML = "<p style='color:var(--muted)'>Requesting permission...</p>";
+        Notification.requestPermission().then(function(perm) {{
+          if (perm !== "granted") {{
+            return updateUI();
+          }}
+          statusEl.innerHTML = "<p style='color:var(--muted)'>Setting up service worker...</p>";
+          return getVapidKey().then(function(key) {{
+            if (!key) return showError("Server VAPID key not available.");
+            return ensureSW().then(function(reg) {{
+              if (!reg) {{
+                var dbg = "no reg";
+                try {{
+                  var r2 = navigator.serviceWorker.controller;
+                  dbg = "controller=" + (r2 ? r2.state : "null");
+                }} catch(x) {{}}
+                return showError("Service worker failed to activate (" + dbg + "). Open browser DevTools &rarr; Application &rarr; Service Workers for details.");
+              }}
+              statusEl.innerHTML = "<p style='color:var(--muted)'>Subscribing to push...</p>";
+              return reg.pushManager.subscribe({{
+                userVisibleOnly: true,
+                applicationServerKey: urlB64(key),
+              }}).then(function(sub) {{
+                statusEl.innerHTML = "<p style='color:var(--muted)'>Saving subscription...</p>";
+                return fetch("/api/push/subscribe", {{
+                  method: "POST",
+                  headers: {{ "Content-Type": "application/json" }},
+                  body: JSON.stringify(sub.toJSON()),
+                }}).then(function(resp) {{
+                  if (!resp.ok) return showError("Server rejected subscription (HTTP " + resp.status + ").");
+                  return updateUI();
+                }});
+              }});
+            }});
+          }});
+        }}).catch(function(e) {{
+          showError("Error: " + (e.message || String(e)));
+        }});
+      }}
+
+      function disablePush() {{
+        btn.disabled = true;
+        btn.textContent = "Disabling...";
+        ensureSW().then(function(reg) {{
+          if (!reg) return updateUI();
+          return reg.pushManager.getSubscription().then(function(sub) {{
+            if (!sub) return updateUI();
+            var endpoint = sub.endpoint;
+            return sub.unsubscribe().then(function() {{
+              return fetch("/api/push/unsubscribe", {{
+                method: "POST",
+                headers: {{ "Content-Type": "application/json" }},
+                body: JSON.stringify({{ endpoint: endpoint }}),
+              }}).catch(function() {{}});
+            }}).then(function() {{
+              return updateUI();
+            }});
+          }});
+        }}).catch(function(e) {{
+          showError("Error disabling: " + (e.message || String(e)));
+        }});
+      }}
+
+      updateUI();
+    }})();
+    </script>
     """
 
 
@@ -344,12 +571,12 @@ def render_tips(
         ]
     )
     current_round_text = (
-        f"Current round: {current_round}. Tips lock {TIP_LOCK_MINUTES} minutes before kickoff. "
-        "If you miss a locked game, the underdog is auto-picked."
+        f"Current round: {current_round}. All tips lock when the first game of the round starts. "
+        "If you haven't tipped by then, the underdog is auto-picked for all games."
         if current_round is not None
         else (
-            f"Current round is not set yet. Tips lock {TIP_LOCK_MINUTES} minutes before kickoff. "
-            "If you miss a locked game, the underdog is auto-picked."
+            "Current round is not set yet. All tips lock when the first game of the round starts. "
+            "If you haven't tipped by then, the underdog is auto-picked for all games."
         )
     )
     round_picker_html = ""
@@ -373,6 +600,7 @@ def render_tips(
         )
 
     now = sydney_now()
+    round_locked = is_round_locked(fixtures, now=now, lock_minutes=TIP_LOCK_MINUTES)
     cards = []
     for fixture in fixtures:
         fixture_id = int(fixture["id"])
@@ -383,7 +611,7 @@ def render_tips(
         kickoff = display_sydney(fixture["start_time_utc"])
         selected_row = tips_by_fixture.get(fixture_id)
         selected = str(selected_row["tip_team"]) if selected_row is not None else None
-        locked = is_tip_locked(fixture["start_time_utc"], now=now, lock_minutes=TIP_LOCK_MINUTES)
+        locked = round_locked
         disabled_attr = "disabled" if locked else ""
         lock_label = (
             "<span class='tip-lock-pill locked'>Locked</span>"
@@ -500,6 +728,8 @@ def render_tipsheet(
     tips_by_user_fixture: dict[tuple[int, int], Row],
     all_submitted: bool,
     total_required: int,
+    round_locked: bool = False,
+    current_user_id: int | None = None,
 ) -> str:
     if round_number is None:
         return '<section class="card"><h2>Tipsheet</h2><p>No fixtures available yet.</p></section>'
@@ -511,12 +741,14 @@ def render_tipsheet(
         ]
     )
 
+    # Tips are visible once the round is locked (first game has started)
+    tips_visible = round_locked
+
     submitted_count = sum(1 for p in participants if p["has_submitted"])
-    status_html = (
-        f"<p class='tipsheet-status ok'>All submissions received ({submitted_count}/{len(participants)}). Everyone's tips are now visible.</p>"
-        if all_submitted
-        else f"<p class='tipsheet-status pending'>Submissions: {submitted_count}/{len(participants)}. Tips unlock after all users submit.</p>"
-    )
+    if tips_visible:
+        status_html = f"<p class='tipsheet-status ok'>Round locked — all tips are now visible. Submissions: {submitted_count}/{len(participants)}.</p>"
+    else:
+        status_html = f"<p class='tipsheet-status pending'>Tips are hidden until the first game of the round starts. Submissions: {submitted_count}/{len(participants)}.</p>"
 
     pending_names = [p["display_name"] for p in participants if not p["has_submitted"]]
     pending_html = ""
@@ -537,10 +769,11 @@ def render_tipsheet(
         avatar_url = str(participant["avatar_url"]) if participant.get("avatar_url") else None
         avatar_html = _avatar_html(participant["display_name"], avatar_url, "ts-avatar")
         cells = []
+        is_own_row = current_user_id is not None and uid == current_user_id
         for fixture in fixtures:
             key = (uid, int(fixture["id"]))
             tip = tips_by_user_fixture.get(key)
-            if not all_submitted:
+            if not tips_visible and not is_own_row:
                 cell = "<td class='tipsheet-cell locked-cell'>-</td>"
             elif tip is None:
                 cell = "<td class='tipsheet-cell empty-cell'>-</td>"
@@ -611,6 +844,11 @@ def render_leaderboard(
     podium_order = [1, 0, 2]  # 2nd, 1st, 3rd
     podium_html = ""
     top3 = players[:3]
+    # Prize calculation: $20 entry, 70% tipping pool, 80%/20% split
+    total_pool = len(players) * 20
+    tipping_pool = total_pool * 0.70
+    prize_1st = tipping_pool * 0.80
+    prize_2nd = tipping_pool * 0.20
     if top3:
         podium_items = []
         for display_idx in podium_order:
@@ -621,6 +859,11 @@ def render_leaderboard(
             rank = display_idx + 1
             avatar = _avatar_html(p["display_name"], p["avatar_url"], "podium-avatar")
             height_class = f"podium-{rank}"
+            prize_html = ""
+            if rank == 1:
+                prize_html = f'<div class="podium-prize">${prize_1st:,.2f}</div>'
+            elif rank == 2:
+                prize_html = f'<div class="podium-prize">${prize_2nd:,.2f}</div>'
             podium_items.append(f"""
               <div class="podium-slot {height_class}">
                 {avatar}
@@ -628,6 +871,7 @@ def render_leaderboard(
                 <div class="podium-points">{p["total_points"]} pts</div>
                 <div class="podium-bar">
                   <span class="podium-rank">#{rank}</span>
+                  {prize_html}
                 </div>
               </div>
             """)
@@ -975,6 +1219,180 @@ def render_predict_ladder(
     """
 
 
+def render_all_predictions(
+    user: Row,
+    predictions_by_user: dict[int, dict[str, Any]],
+    teams: list[dict[str, Any]],
+    season_year: int,
+    season_started: bool,
+    actual_ladder: list[dict[str, Any]],
+    leaderboard: list[dict[str, Any]],
+) -> str:
+    if not season_started:
+        return f"""
+        <section class="card">
+          <h2>Ladder Predictions &mdash; {season_year}</h2>
+          <p>Predictions will be visible once the first game of the season starts.</p>
+          <p><a href="/predict-ladder">Submit your prediction &rarr;</a></p>
+        </section>
+        """
+
+    if not predictions_by_user:
+        return f"""
+        <section class="card">
+          <h2>Ladder Predictions &mdash; {season_year}</h2>
+          <p>No predictions have been submitted yet.</p>
+          <p><a href="/predict-ladder">Submit your prediction &rarr;</a></p>
+        </section>
+        """
+
+    team_logos = {t["team"]: t.get("logo_url") for t in teams}
+
+    # Leaderboard section
+    lb_html = ""
+    if leaderboard and actual_ladder:
+        lb_rows = []
+        for idx, entry in enumerate(leaderboard, start=1):
+            avatar = _avatar_html(entry["display_name"], entry["avatar_url"], "pldr-lb-avatar")
+            is_me = " class='pldr-lb-me'" if entry["user_id"] == int(user["id"]) else ""
+            lb_rows.append(
+                f"<tr{is_me}>"
+                f"<td>{idx}</td>"
+                f"<td class='pldr-lb-player'>{avatar}<span>{escape(entry['display_name'])}</span></td>"
+                f"<td class='pldr-lb-diff'>{entry['total_diff']}</td>"
+                f"</tr>"
+            )
+        lb_html = f"""
+        <section class="card" style="margin-top:1rem">
+          <h3>Ladder Prediction Standings</h3>
+          <p class="pldr-note">Lower score = closer to actual ladder. Best possible score is 0.</p>
+          <table class="pldr-lb-table">
+            <thead><tr><th>#</th><th>Player</th><th>Diff</th></tr></thead>
+            <tbody>{"".join(lb_rows)}</tbody>
+          </table>
+        </section>
+        """
+
+    # Build prediction columns
+    users_data = list(predictions_by_user.values())
+    num_positions = max((len(u["predictions"]) for u in users_data), default=0)
+
+    header_cols = []
+    for u_data in users_data:
+        avatar = _avatar_html(u_data["display_name"], u_data["avatar_url"], "ts-avatar")
+        first_name = u_data["display_name"].split()[0] if u_data["display_name"] else "User"
+        header_cols.append(
+            f'<th class="tipster-col">{avatar}<div class="ts-name">{escape(first_name)}</div></th>'
+        )
+
+    body_rows = []
+    for pos in range(1, num_positions + 1):
+        zone = ""
+        if pos == 1:
+            zone = f'<tr><td class="pldr-zone pldr-zone-finals" colspan="{len(users_data) + 1}">Finals (1&ndash;8)</td></tr>'
+        elif pos == 9:
+            zone = f'<tr><td class="pldr-zone pldr-zone-elim" colspan="{len(users_data) + 1}">Eliminated (9&ndash;{num_positions})</td></tr>'
+
+        cells = [f'<td class="pred-pos">{pos}</td>']
+        for u_data in users_data:
+            preds = u_data["predictions"]
+            team = preds[pos - 1]["team"] if pos <= len(preds) else "-"
+            logo = team_logos.get(team)
+            if logo:
+                cells.append(f'<td class="tipsheet-cell"><img src="{escape(str(logo))}" alt="" class="pick-logo"><div class="pick-team">{escape(team)}</div></td>')
+            else:
+                cells.append(f'<td class="tipsheet-cell"><div class="pick-team">{escape(team)}</div></td>')
+
+        body_rows.append(f"{zone}<tr>{''.join(cells)}</tr>")
+
+    return f"""
+    <section class="card">
+      <h2>Ladder Predictions &mdash; {season_year}</h2>
+      <p><a href="/predict-ladder">Edit your prediction &rarr;</a></p>
+      <div class="tipsheet-wrap">
+        <table class="tipsheet-table">
+          <thead>
+            <tr>
+              <th class="pred-pos-hdr">#</th>
+              {"".join(header_cols)}
+            </tr>
+          </thead>
+          <tbody>
+            {"".join(body_rows)}
+          </tbody>
+        </table>
+      </div>
+    </section>
+    {lb_html}
+    """
+
+
+def render_ladder_adjust(
+    user: Row,
+    predictions: list[dict[str, Any]],
+    teams: list[dict[str, Any]],
+    completed_rounds: list[int],
+    used_rounds: set[int],
+    season_year: int,
+) -> str:
+    """Render the adjustment section shown below the main prediction."""
+    if not predictions:
+        return ""
+
+    # Find available rounds (completed but not yet used)
+    available_rounds = [r for r in completed_rounds if r not in used_rounds]
+    if not available_rounds:
+        used_list = ", ".join(f"R{r}" for r in sorted(used_rounds)) if used_rounds else "none"
+        return f"""
+        <section class="card" style="margin-top:1rem">
+          <h3>Round Adjustment</h3>
+          <p>No completed rounds available for adjustment right now.</p>
+          <p style="font-size:.85rem;color:var(--muted)">Moves used: {used_list}</p>
+        </section>
+        """
+
+    team_logos = {t["team"]: t.get("logo_url") for t in teams}
+
+    # Build team options
+    team_options = []
+    for p in predictions:
+        logo = team_logos.get(p["team"])
+        logo_attr = f' data-logo="{escape(str(logo))}"' if logo else ""
+        team_options.append(
+            f'<option value="{escape(p["team"])}"{logo_attr}>{p["position"]}. {escape(p["team"])}</option>'
+        )
+
+    round_options = []
+    for r in available_rounds:
+        round_options.append(f'<option value="{r}">Round {r}</option>')
+
+    used_list = ", ".join(f"R{r}" for r in sorted(used_rounds)) if used_rounds else "none yet"
+
+    return f"""
+    <section class="card" style="margin-top:1rem">
+      <h3>Round Adjustment</h3>
+      <p>After each completed round, you may move <strong>one team</strong> up or down by <strong>one position</strong>.</p>
+      <p style="font-size:.85rem;color:var(--muted)">Moves used: {used_list}</p>
+      <form method="post" action="/predict-ladder/adjust" class="inline-form">
+        <input type="hidden" name="season_year" value="{season_year}">
+        <label>Round:
+          <select name="round_number">{"".join(round_options)}</select>
+        </label>
+        <label>Team:
+          <select name="team">{"".join(team_options)}</select>
+        </label>
+        <label>Direction:
+          <select name="direction">
+            <option value="up">&#9650; Move Up</option>
+            <option value="down">&#9660; Move Down</option>
+          </select>
+        </label>
+        <button type="submit">Apply Move</button>
+      </form>
+    </section>
+    """
+
+
 def render_admin(
     user: Row,
     last_sync: str | None,
@@ -1022,5 +1440,135 @@ def render_admin(
       <h3>Latest Sync Result</h3>
       {summary_block}
       {fb_status_html}
+      <p><a href="/admin/users">Manage Users</a></p>
     </section>
     """
+
+
+def render_admin_users(users: list, flash_password: dict | None = None) -> str:
+    rows = []
+    for u in users:
+        uid = int(u["id"])
+        name = escape(str(u["display_name"]))
+        email = escape(str(u["email"]))
+        role = "Admin" if int(u["is_admin"]) == 1 else "User"
+        provider = escape(str(u["auth_provider"] or "local"))
+        avatar_url = str(u["avatar_url"]) if u["avatar_url"] else None
+        avatar_html = _avatar_html(str(u["display_name"]), avatar_url, "admin-user-avatar")
+
+        # Password flash for this user (after reset)
+        pw_flash = ""
+        if flash_password and flash_password.get("user_id") == uid:
+            temp_pw = escape(str(flash_password["password"]))
+            pw_flash = f"""
+            <div class="flash ok" style="margin:.5rem 0;font-size:.85rem">
+              New password: <code style="user-select:all;font-weight:bold">{temp_pw}</code>
+              — share this with the user, it won't be shown again.
+            </div>
+            """
+
+        rows.append(f"""
+        <article class="card admin-user-card">
+          <div class="admin-user-header">
+            {avatar_html}
+            <div>
+              <strong>{name}</strong><br>
+              <span class="admin-user-meta">{email} · {role} · {provider}</span>
+            </div>
+          </div>
+          {pw_flash}
+          <div class="admin-user-actions">
+            <form method="post" action="/admin/users/{uid}/reset-password" class="inline-form"
+                  onsubmit="return confirm('Reset password for {name}?')">
+              <button type="submit" class="btn-sm btn-secondary">Reset Password</button>
+            </form>
+            <form method="post" action="/admin/users/{uid}/avatar" class="inline-form"
+                  enctype="multipart/form-data">
+              <input type="file" name="avatar" accept="image/*" required style="max-width:180px">
+              <button type="submit" class="btn-sm">Upload Photo</button>
+            </form>
+            <form method="post" action="/admin/users/{uid}/delete" class="inline-form"
+                  onsubmit="return confirm('Permanently delete {name} and ALL their data? This cannot be undone.')">
+              <button type="submit" class="btn-sm btn-danger">Delete</button>
+            </form>
+          </div>
+        </article>
+        """)
+
+    return f"""
+    <section class="card">
+      <h2>User Management</h2>
+      <p><a href="/admin">&larr; Back to Admin</a></p>
+      <p>{len(users)} registered user(s)</p>
+      <div class="admin-users-list">
+        {"".join(rows)}
+      </div>
+    </section>
+    """
+
+
+def render_privacy() -> str:
+    return """
+    <section class="card">
+      <h2>Privacy Policy</h2>
+      <p><strong>Last updated:</strong> February 2026</p>
+
+      <h3>What we collect</h3>
+      <p>When you create an account or sign in with Facebook, we store your name, email address,
+         and profile picture. We also store the tipping selections you make each round.</p>
+
+      <h3>How we use it</h3>
+      <p>Your information is used solely to run the tipping competition — displaying your name
+         on the leaderboard, tracking your tips, and showing your avatar. We do not sell, share,
+         or use your data for advertising.</p>
+
+      <h3>Facebook data</h3>
+      <p>If you sign in with Facebook, we receive your public profile and email address.
+         We do not post to your timeline or access your friends list.</p>
+
+      <h3>Data storage</h3>
+      <p>Your data is stored securely on our server. Passwords are hashed using PBKDF2 and
+         are never stored in plain text.</p>
+
+      <h3>Data deletion</h3>
+      <p>You can request deletion of your account and all associated data at any time.
+         See our <a href="/remove">Data Deletion</a> page for instructions.</p>
+
+      <h3>Contact</h3>
+      <p>For privacy questions, contact the site administrator.</p>
+    </section>
+    """
+
+
+def render_data_deletion() -> str:
+    return """
+    <section class="card">
+      <h2>Data Deletion Instructions</h2>
+
+      <p>If you would like to delete your account and all associated data from Aldo's Tipping Comp,
+         please follow these steps:</p>
+
+      <ol>
+        <li>Contact the site administrator and request account deletion.</li>
+        <li>Provide the email address associated with your account.</li>
+        <li>Your account, tip history, and any stored personal data will be permanently deleted.</li>
+      </ol>
+
+      <h3>What gets deleted</h3>
+      <ul>
+        <li>Your user account (name, email, password)</li>
+        <li>Your profile picture</li>
+        <li>All tipping selections and history</li>
+        <li>Your Facebook connection (if applicable)</li>
+        <li>Any active sessions</li>
+      </ul>
+
+      <p>Deletion is typically completed within 7 days of receiving your request.</p>
+
+      <h3>Facebook users</h3>
+      <p>If you signed in with Facebook, you can also remove this app from your
+         Facebook settings under <strong>Settings → Apps and Websites</strong>.
+         This will revoke the app's access to your Facebook data.</p>
+    </section>
+    """
+
